@@ -4,9 +4,9 @@ services:
   mcp-shield:
     build: .
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
-      MCP_SHIELD_API_KEY: ${MCP_SHIELD_API_KEY:-}
+      MCP_SHIELD_API_KEY: ${MCP_SHIELD_API_KEY:?MCP_SHIELD_API_KEY must be set}
       MCP_SHIELD_LOG_LEVEL: INFO
       MCP_SHIELD_PROMETHEUS_ENABLED: "true"
       MCP_SHIELD_OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
@@ -24,8 +24,8 @@ services:
 
   prometheus:
     image: prom/prometheus:v2.47.0
-    ports:
-      - "9090:9090"
+    expose:
+      - "9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -37,9 +37,9 @@ services:
   grafana:
     image: grafana/grafana:10.1.0
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?GRAFANA_PASSWORD must be set}
       GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
       - grafana_data:/var/lib/grafana
@@ -53,7 +53,7 @@ services:
     build: .
     command: ["python", "-m", "streamlit", "run", "src/mcp_shield/observability/dashboard.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
     ports:
-      - "8501:8501"
+      - "127.0.0.1:8501:8501"
     environment:
       MCP_SHIELD_REPORT_DIR: /tmp/mcp-shield-reports
     volumes:
