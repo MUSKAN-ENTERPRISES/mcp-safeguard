@@ -2,9 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, "security/**" ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -39,8 +43,8 @@ jobs:
       run: pip install ruff mypy
     - name: Ruff lint
       run: ruff check src/
-    - name: Type check (advisory)
-      run: mypy src/ --ignore-missing-imports || true
+    - name: Type check
+      run: mypy src/ --ignore-missing-imports
 
   security-scan:
     runs-on: ubuntu-latest
