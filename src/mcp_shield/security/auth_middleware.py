@@ -19,16 +19,7 @@ class AuthContext:
 
 
 def verify_api_key(provided_key: str, expected_key: str) -> bool:
-    """
-    Constant-time API key comparison to prevent timing attacks.
-
-    Args:
-        provided_key: The key provided in the request.
-        expected_key: The expected key from configuration.
-
-    Returns:
-        True if keys match.
-    """
+    """Constant-time API key comparison."""
     if not provided_key or not expected_key:
         return False
     return hmac.compare_digest(
@@ -38,15 +29,7 @@ def verify_api_key(provided_key: str, expected_key: str) -> bool:
 
 
 def extract_bearer_token(authorization_header: str) -> str | None:
-    """
-    Extract bearer token from Authorization header value.
-
-    Args:
-        authorization_header: The raw Authorization header value.
-
-    Returns:
-        The token string, or None if not a Bearer header.
-    """
+    """Extract a Bearer token from an Authorization header."""
     if not authorization_header:
         return None
     parts = authorization_header.strip().split(" ", 1)
@@ -56,17 +39,8 @@ def extract_bearer_token(authorization_header: str) -> str | None:
 
 
 def generate_api_key(prefix: str = "msh") -> str:
-    """
-    Generate a cryptographically secure API key.
-
-    Args:
-        prefix: Short prefix for key type identification.
-
-    Returns:
-        A formatted API key string.
-    """
-    token = secrets.token_urlsafe(32)
-    return f"{prefix}_{token}"
+    """Generate a cryptographically secure API key."""
+    return f"{prefix}_{secrets.token_urlsafe(32)}"
 
 
 def authenticate_request(
@@ -74,27 +48,20 @@ def authenticate_request(
     authorization_header: str | None,
     expected_api_key: str | None,
 ) -> AuthContext:
-    """
-    Authenticate an incoming request using API key or Bearer token.
+    """Authenticate an incoming request using API key or Bearer token.
 
-    Args:
-        api_key_header: Value of the X-API-Key header.
-        authorization_header: Value of the Authorization header.
-        expected_api_key: The configured API key to check against.
-
-    Returns:
-        AuthContext indicating whether the request is authenticated.
+    Authentication is fail-closed: an absent API key configuration no longer
+    grants anonymous wildcard access. This prevents accidental public exposure
+    when the service is deployed with a missing environment variable.
     """
-    # No auth configured — open access (warn in production)
     if not expected_api_key:
         return AuthContext(
-            client_id="anonymous",
-            authenticated=True,
+            client_id="unauthenticated",
+            authenticated=False,
             auth_method="none",
-            scopes=["*"],
+            scopes=[],
         )
 
-    # Check X-API-Key header
     if api_key_header and verify_api_key(api_key_header, expected_api_key):
         client_id = hashlib.sha256(api_key_header.encode()).hexdigest()[:16]
         return AuthContext(
@@ -104,7 +71,6 @@ def authenticate_request(
             scopes=["scan:read", "scan:write", "report:read"],
         )
 
-    # Check Authorization: Bearer header
     if authorization_header:
         token = extract_bearer_token(authorization_header)
         if token and verify_api_key(token, expected_api_key):
