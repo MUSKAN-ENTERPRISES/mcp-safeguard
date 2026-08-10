@@ -26,7 +26,7 @@ jobs:
     - name: Run tests
       run: pytest tests/ -v --tb=short
     - name: Self-scan (mcp-safeguard scans the bundled demo config)
-      run: mcp-safeguard scan examples/demo-vulnerable-config.json || true
+      run: mcp-safeguard scan examples/demo-vulnerable-config.json
 
   lint:
     runs-on: ubuntu-latest
@@ -55,7 +55,7 @@ jobs:
         python -m pip install --upgrade pip
         pip install -e .
     - name: Run security scan (self-scan of demo config)
-      run: mcp-safeguard scan examples/demo-vulnerable-config.json --output security-report.json --format json || true
+      run: mcp-safeguard scan examples/demo-vulnerable-config.json --output security-report.json --format json
     - name: Upload security report
       if: always()
       uses: actions/upload-artifact@v4
