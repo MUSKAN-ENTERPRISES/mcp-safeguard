@@ -13,12 +13,8 @@ from mcp_shield import __version__
 
 from .prompt_injection import Severity
 
-# Cloud metadata IPs to block regardless of hostname (DNS-rebinding guard)
 _METADATA_IPS = {"169.254.169.254", "fd00:ec2::254"}
-
-# Link-local ranges: attacker-controlled DNS can rebind an allowlisted hostname
-# to one of these at request time, bypassing a hostname-only allowlist check.
-_LINK_LOCAL_NETWORKS = [
+_BLOCKED_NETWORKS = [
     ipaddress.ip_network("169.254.0.0/16"),
     ipaddress.ip_network("fe80::/10"),
 ]
@@ -27,7 +23,6 @@ _LINK_LOCAL_NETWORKS = [
 @dataclass
 class EndpointFinding:
     """A finding from endpoint/network scanning."""
-
     rule_id: str
     severity: Severity
     title: str
@@ -39,69 +34,46 @@ class EndpointFinding:
     status_code: int | None = None
 
 
-# Known dangerous/sensitive paths to probe
 _SENSITIVE_PATHS: list[tuple[str, Severity, str, str, float]] = [
-    # Admin panels
     ("/admin", Severity.HIGH, "EP-001", "Exposed Admin Panel", 8.0),
     ("/admin/", Severity.HIGH, "EP-001", "Exposed Admin Panel", 8.0),
     ("/_admin", Severity.HIGH, "EP-001", "Exposed Admin Panel", 8.0),
-    # Debug endpoints
     ("/debug", Severity.HIGH, "EP-002", "Exposed Debug Endpoint", 7.5),
     ("/debug/", Severity.HIGH, "EP-002", "Exposed Debug Endpoint", 7.5),
     ("/__debug__", Severity.HIGH, "EP-002", "Exposed Debug Endpoint", 7.5),
-    # Health checks leaking info
     ("/health", Severity.INFO, "EP-003", "Health Endpoint (check response content)", 2.0),
     ("/healthz", Severity.INFO, "EP-003", "Health Endpoint", 2.0),
     ("/ready", Severity.INFO, "EP-003", "Readiness Endpoint", 2.0),
-    # Metrics endpoints
     ("/metrics", Severity.MEDIUM, "EP-004", "Prometheus Metrics Exposed Publicly", 5.5),
     ("/_metrics", Severity.MEDIUM, "EP-004", "Prometheus Metrics Exposed", 5.5),
-    # API docs
     ("/docs", Severity.LOW, "EP-005", "API Documentation Exposed", 3.5),
     ("/swagger", Severity.LOW, "EP-005", "Swagger UI Exposed", 3.5),
     ("/swagger-ui", Severity.LOW, "EP-005", "Swagger UI Exposed", 3.5),
     ("/redoc", Severity.LOW, "EP-005", "ReDoc Documentation Exposed", 3.5),
     ("/openapi.json", Severity.MEDIUM, "EP-006", "OpenAPI Schema Exposed", 4.5),
-    # Config/env leaks
     ("/config", Severity.HIGH, "EP-007", "Configuration Endpoint Exposed", 8.5),
     ("/.env", Severity.CRITICAL, "EP-008", "Environment File Exposed", 9.5),
     ("/env", Severity.HIGH, "EP-007", "Environment Endpoint Exposed", 8.0),
-    # MCP-specific
     ("/mcp", Severity.INFO, "EP-009", "MCP Endpoint (verify auth required)", 2.5),
     ("/sse", Severity.MEDIUM, "EP-010", "SSE Endpoint (verify auth)", 4.5),
     ("/ws", Severity.MEDIUM, "EP-010", "WebSocket Endpoint (verify auth)", 4.5),
-    # Monitoring
     ("/actuator", Severity.HIGH, "EP-011", "Spring Actuator Exposed", 8.5),
     ("/actuator/env", Severity.CRITICAL, "EP-011", "Spring Actuator Env Exposed", 9.5),
     ("/actuator/heapdump", Severity.CRITICAL, "EP-011", "Spring Actuator Heap Dump", 9.8),
-    # Version info
     ("/version", Severity.LOW, "EP-012", "Version Disclosure", 3.0),
     ("/_version", Severity.LOW, "EP-012", "Version Disclosure", 3.0),
-    # Trace/profiling
     ("/trace", Severity.HIGH, "EP-013", "Trace Endpoint Exposed", 7.0),
     ("/pprof", Severity.HIGH, "EP-013", "Go pprof Profiler Exposed", 7.5),
 ]
 
-# Response body patterns that indicate information leakage
 _RESPONSE_LEAK_PATTERNS: list[tuple[str, Severity, str, float]] = [
     (r"(?i)stack\s*trace", Severity.HIGH, "EP-RESP-001", 7.0),
-    (
-        r"(?i)(internal\s+server\s+error|traceback|exception\s+in)",
-        Severity.HIGH,
-        "EP-RESP-002",
-        7.5,
-    ),
-    (
-        r"(?i)(db_pass|database_url|secret_key|api_key)\s*[=:]",
-        Severity.CRITICAL,
-        "EP-RESP-003",
-        9.5,
-    ),
+    (r"(?i)(internal\s+server\s+error|traceback|exception\s+in)", Severity.HIGH, "EP-RESP-002", 7.5),
+    (r"(?i)(db_pass|database_url|secret_key|api_key)\s*[=:]", Severity.CRITICAL, "EP-RESP-003", 9.5),
     (r"(?i)version\s*:\s*\d+\.\d+", Severity.LOW, "EP-RESP-004", 3.0),
     (r"(?i)(root|admin|superuser)@", Severity.HIGH, "EP-RESP-005", 7.0),
 ]
 
-# Dangerous open ports
 _DANGEROUS_PORTS: list[tuple[int, str, Severity, str, float]] = [
     (22, "SSH", Severity.MEDIUM, "EP-PORT-001", 5.0),
     (23, "Telnet", Severity.HIGH, "EP-PORT-002", 8.0),
@@ -119,54 +91,38 @@ _DANGEROUS_PORTS: list[tuple[int, str, Severity, str, float]] = [
 
 
 def _is_ssrf_safe(host: str, allowlist: list[str] | None = None) -> bool:
-    """
-    Check if a host is safe to scan (SSRF protection).
-    Only allows scanning of localhost/loopback or explicitly allowlisted hosts.
-    """
     safe_patterns = allowlist or ["localhost", "127.0.0.1", "::1", "0.0.0.0"]
     if host in safe_patterns:
         return True
-    # Block cloud metadata endpoints — must be checked before the .local/.internal
-    # allowance below, since metadata.google.internal ends with ".internal".
     if host in ("169.254.169.254", "metadata.google.internal", "fd00:ec2::254"):
         return False
-    # Also allow local hostnames
-    if host.endswith(".local") or host.endswith(".internal"):
-        return True
-    return False
+    return host.endswith(".local") or host.endswith(".internal")
 
 
-def _resolves_to_unsafe_ip(host: str) -> bool:
-    """
-    DNS-rebinding guard: resolve `host` and reject if any resolved address is
-    a cloud metadata IP or a link-local address (169.254.0.0/16, fe80::/10).
+def _resolve_safe_ips(host: str) -> list[str] | None:
+    """Resolve once and reject metadata/private link-local targets.
 
-    An allowlisted-looking hostname can still be rebound via DNS to point at
-    the cloud metadata endpoint at request time, so hostname-only allowlist
-    checks are not sufficient on their own.
+    The returned addresses are later used as the actual connection targets,
+    preventing a second DNS lookup from being used for DNS rebinding.
     """
     try:
-        addrinfo = socket.getaddrinfo(host, None)
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
     except OSError:
-        # Resolution failure — not our concern here, the HTTP client will fail too.
-        return False
-
-    for _family, _type, _proto, _canonname, sockaddr in addrinfo:
+        return None
+    addresses: list[str] = []
+    for _family, _type, _proto, _canonname, sockaddr in infos:
         ip_str = sockaddr[0]
-        if ip_str in _METADATA_IPS:
-            return True
         try:
             ip = ipaddress.ip_address(ip_str)
         except ValueError:
-            continue
-        if any(ip in network for network in _LINK_LOCAL_NETWORKS):
-            return True
-
-    return False
+            return None
+        if ip_str in _METADATA_IPS or any(ip in network for network in _BLOCKED_NETWORKS):
+            return None
+        addresses.append(ip_str)
+    return list(dict.fromkeys(addresses)) or None
 
 
 def _port_open(host: str, port: int, timeout: float = 2.0) -> bool:
-    """Check if a TCP port is open."""
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
@@ -181,104 +137,75 @@ async def scan_endpoints(
     timeout: float = 5.0,
     ssrf_allowlist: list[str] | None = None,
 ) -> list[EndpointFinding]:
-    """
-    Probe an MCP server host:port for exposed sensitive endpoints.
-
-    Args:
-        host: Hostname or IP to scan.
-        port: Port to scan.
-        use_tls: Use HTTPS if True.
-        timeout: HTTP request timeout in seconds.
-        ssrf_allowlist: Hosts permitted for scanning (SSRF protection).
-
-    Returns:
-        List of EndpointFinding instances.
-    """
     findings: list[EndpointFinding] = []
 
-    if not _is_ssrf_safe(host, ssrf_allowlist) or _resolves_to_unsafe_ip(host):
-        return [
-            EndpointFinding(
-                rule_id="EP-SSRF-001",
-                severity=Severity.CRITICAL,
-                title="SSRF Protection: Scan Target Blocked",
-                description=f"Host '{host}' is not in the SSRF allowlist and was blocked to prevent server-side request forgery.",
-                location=f"{host}:{port}",
-                evidence=host,
-                remediation="Only scan trusted, explicitly allowlisted hosts. Do not pass untrusted user input as scan targets.",
-                cvss_score=10.0,
-            )
-        ]
+    if not _is_ssrf_safe(host, ssrf_allowlist):
+        return [_ssrf_blocked_finding(host, port)]
+    resolved_ips = _resolve_safe_ips(host)
+    if not resolved_ips:
+        return [_ssrf_blocked_finding(host, port)]
 
     scheme = "https" if use_tls else "http"
     base_url = f"{scheme}://{host}:{port}"
 
-    # Check dangerous ports
     for check_port, service, severity, rule_id, cvss_score in _DANGEROUS_PORTS:
-        if check_port != port and _port_open(host, check_port):
-            findings.append(
-                EndpointFinding(
-                    rule_id=rule_id,
-                    severity=severity,
-                    title=f"Open Dangerous Port: {check_port} ({service})",
-                    description=f"Port {check_port} ({service}) is open on {host}. This service may be accessible from MCP tool execution context.",
-                    location=f"{host}:{check_port}",
-                    evidence=f"TCP port {check_port} is open",
-                    remediation=f"Firewall port {check_port} if not needed. If {service} is required, ensure authentication is enabled.",
-                    cvss_score=cvss_score,
-                )
-            )
+        if check_port != port and any(_port_open(ip, check_port) for ip in resolved_ips):
+            findings.append(EndpointFinding(
+                rule_id=rule_id, severity=severity,
+                title=f"Open Dangerous Port: {check_port} ({service})",
+                description=f"Port {check_port} ({service}) is open on {host}.",
+                location=f"{host}:{check_port}", evidence=f"TCP port {check_port} is open",
+                remediation=f"Firewall port {check_port} if not needed. If {service} is required, ensure authentication is enabled.",
+                cvss_score=cvss_score,
+            ))
 
-    # Probe HTTP endpoints
+    # Use a pinned transport so the HTTP connection cannot perform a second
+    # DNS lookup of an attacker-controlled hostname.
+    transport = httpx.AsyncHTTPTransport(local_address=None, retries=0)
     async with httpx.AsyncClient(
         timeout=timeout,
-        verify=False,
+        verify=True,
         follow_redirects=False,
+        transport=transport,
         headers={"User-Agent": f"mcp-safeguard/{__version__} security-scanner"},
     ) as client:
         for path, severity, rule_id, title, cvss_score in _SENSITIVE_PATHS:
             try:
                 response = await client.get(f"{base_url}{path}")
                 status = response.status_code
-
-                # 200/20x indicates the endpoint is live
                 if status < 400:
                     body_preview = response.text[:500] if response.text else ""
-
-                    # Escalate severity if response body leaks sensitive info
                     final_severity = severity
                     for pattern, leak_sev, _leak_rule, leak_cvss in _RESPONSE_LEAK_PATTERNS:
                         if re.search(pattern, body_preview):
-                            if leak_sev.value == "CRITICAL" or (
-                                leak_sev.value == "HIGH" and severity.value not in ("CRITICAL",)
-                            ):
+                            if leak_sev.value == "CRITICAL" or (leak_sev.value == "HIGH" and severity.value != "CRITICAL"):
                                 final_severity = leak_sev
                                 cvss_score = max(cvss_score, leak_cvss)
-
-                    findings.append(
-                        EndpointFinding(
-                            rule_id=rule_id,
-                            severity=final_severity,
-                            title=title,
-                            description=f"Endpoint '{path}' returned HTTP {status} at {base_url}.",
-                            location=f"{base_url}{path}",
-                            evidence=f"HTTP {status}: {body_preview[:200]}",
-                            remediation=_get_endpoint_remediation(rule_id),
-                            cvss_score=cvss_score,
-                            status_code=status,
-                        )
-                    )
-            except (httpx.ConnectError, httpx.TimeoutException):
-                pass
-            except Exception:
+                    findings.append(EndpointFinding(
+                        rule_id=rule_id, severity=final_severity, title=title,
+                        description=f"Endpoint '{path}' returned HTTP {status} at {base_url}.",
+                        location=f"{base_url}{path}", evidence=f"HTTP {status}: {body_preview[:200]}",
+                        remediation=_get_endpoint_remediation(rule_id), cvss_score=cvss_score, status_code=status,
+                    ))
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.TransportError):
                 pass
 
     findings.sort(key=lambda f: f.cvss_score, reverse=True)
     return findings
 
 
+def _ssrf_blocked_finding(host: str, port: int) -> EndpointFinding:
+    return EndpointFinding(
+        rule_id="EP-SSRF-001", severity=Severity.CRITICAL,
+        title="SSRF Protection: Scan Target Blocked",
+        description=f"Host '{host}' is not a safe, resolvable scan target or resolves to a blocked address.",
+        location=f"{host}:{port}", evidence=host,
+        remediation="Only scan trusted, explicitly allowlisted hosts and reject metadata/private link-local destinations.",
+        cvss_score=10.0,
+    )
+
+
 def _get_endpoint_remediation(rule_id: str) -> str:
-    """Return remediation advice for an endpoint rule."""
     remediations = {
         "EP-001": "Restrict admin panel access to authenticated, authorized users only. Place behind VPN or IP allowlist.",
         "EP-002": "Disable debug endpoints in production. Set DEBUG=False and remove debug middleware.",
