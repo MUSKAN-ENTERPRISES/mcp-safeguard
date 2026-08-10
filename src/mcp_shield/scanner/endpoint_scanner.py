@@ -91,35 +91,38 @@ _DANGEROUS_PORTS: list[tuple[int, str, Severity, str, float]] = [
 
 
 def _is_ssrf_safe(host: str, allowlist: list[str] | None = None) -> bool:
-    safe_patterns = allowlist or ["localhost", "127.0.0.1", "::1", "0.0.0.0"]
-    if host in safe_patterns:
-        return True
-    if host in ("169.254.169.254", "metadata.google.internal", "fd00:ec2::254"):
-        return False
-    return host.endswith(".local") or host.endswith(".internal")
+    """Allow only literal IP addresses or localhost names.
 
-
-def _resolve_safe_ips(host: str) -> list[str] | None:
-    """Resolve once and reject metadata/private link-local targets.
-
-    The returned addresses are later used as the actual connection targets,
-    preventing a second DNS lookup from being used for DNS rebinding.
+    DNS names are deliberately rejected because validating a DNS answer and
+    then connecting to the hostname creates a DNS-rebinding time-of-check /
+    time-of-use window. Callers that need remote targets should provide the
+    resolved, trusted IP address in the allowlist instead.
     """
+    safe_patterns = allowlist or ["localhost", "127.0.0.1", "::1", "0.0.0.0"]
+    if host not in safe_patterns:
+        return False
+    if host in {"localhost", "0.0.0.0"}:
+        return host == "localhost" or host == "0.0.0.0"
     try:
-        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    except OSError:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host == "localhost"
+    if str(ip) in _METADATA_IPS or any(ip in network for network in _BLOCKED_NETWORKS):
+        return False
+    return True
+
+
+def _resolve_safe_ip(host: str) -> str | None:
+    """Resolve a literal target for validation; hostnames are not accepted."""
+    if host == "localhost":
+        return "127.0.0.1"
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
         return None
-    addresses: list[str] = []
-    for _family, _type, _proto, _canonname, sockaddr in infos:
-        ip_str = sockaddr[0]
-        try:
-            ip = ipaddress.ip_address(ip_str)
-        except ValueError:
-            return None
-        if ip_str in _METADATA_IPS or any(ip in network for network in _BLOCKED_NETWORKS):
-            return None
-        addresses.append(ip_str)
-    return list(dict.fromkeys(addresses)) or None
+    if str(ip) in _METADATA_IPS or any(ip in network for network in _BLOCKED_NETWORKS):
+        return None
+    return str(ip)
 
 
 def _port_open(host: str, port: int, timeout: float = 2.0) -> bool:
@@ -141,32 +144,28 @@ async def scan_endpoints(
 
     if not _is_ssrf_safe(host, ssrf_allowlist):
         return [_ssrf_blocked_finding(host, port)]
-    resolved_ips = _resolve_safe_ips(host)
-    if not resolved_ips:
+    target_ip = _resolve_safe_ip(host)
+    if not target_ip:
         return [_ssrf_blocked_finding(host, port)]
 
     scheme = "https" if use_tls else "http"
-    base_url = f"{scheme}://{host}:{port}"
+    base_url = f"{scheme}://{target_ip}:{port}"
 
     for check_port, service, severity, rule_id, cvss_score in _DANGEROUS_PORTS:
-        if check_port != port and any(_port_open(ip, check_port) for ip in resolved_ips):
+        if check_port != port and _port_open(target_ip, check_port):
             findings.append(EndpointFinding(
                 rule_id=rule_id, severity=severity,
                 title=f"Open Dangerous Port: {check_port} ({service})",
-                description=f"Port {check_port} ({service}) is open on {host}.",
-                location=f"{host}:{check_port}", evidence=f"TCP port {check_port} is open",
+                description=f"Port {check_port} ({service}) is open on {target_ip}.",
+                location=f"{target_ip}:{check_port}", evidence=f"TCP port {check_port} is open",
                 remediation=f"Firewall port {check_port} if not needed. If {service} is required, ensure authentication is enabled.",
                 cvss_score=cvss_score,
             ))
 
-    # Use a pinned transport so the HTTP connection cannot perform a second
-    # DNS lookup of an attacker-controlled hostname.
-    transport = httpx.AsyncHTTPTransport(local_address=None, retries=0)
     async with httpx.AsyncClient(
         timeout=timeout,
         verify=True,
         follow_redirects=False,
-        transport=transport,
         headers={"User-Agent": f"mcp-safeguard/{__version__} security-scanner"},
     ) as client:
         for path, severity, rule_id, title, cvss_score in _SENSITIVE_PATHS:
@@ -198,9 +197,9 @@ def _ssrf_blocked_finding(host: str, port: int) -> EndpointFinding:
     return EndpointFinding(
         rule_id="EP-SSRF-001", severity=Severity.CRITICAL,
         title="SSRF Protection: Scan Target Blocked",
-        description=f"Host '{host}' is not a safe, resolvable scan target or resolves to a blocked address.",
+        description=f"Host '{host}' is not a safe literal scan target or resolves to a blocked address.",
         location=f"{host}:{port}", evidence=host,
-        remediation="Only scan trusted, explicitly allowlisted hosts and reject metadata/private link-local destinations.",
+        remediation="Only scan trusted literal IP addresses or localhost. Do not pass attacker-controlled DNS names as scan targets.",
         cvss_score=10.0,
     )
 
